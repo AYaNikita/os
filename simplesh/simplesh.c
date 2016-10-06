@@ -1,143 +1,155 @@
-#include <string.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <stdlib.h>
-#include <sys/wait.h>
-#include <errno.h>
-#include <string>
-#include <vector>
-#include <algorithm>
+#include<stdio.h>
+#include<string>
+#include<vector>
+#include<unistd.h>
+#include<iostream>
+#include<sys/wait.h>
+#include<errno.h>
+#include<string.h>
+#include<signal.h>
+#include<algorithm>
+
+#define TESTERR(x) test_error(x,false,__func__)
+#define BUFFER 4096
 
 using namespace std;
 
-vector<pid_t> childs;
-size_t BUFFER_SIZE = 8192;
-vector<string> tmp;
+vector<int *> pipes;
+vector<int> processes;
+int main_pid;
 
-void sig_handler(int signo, siginfo_t *siginfo, void *context) {
-    for (auto i = 0; i < childs.size(); i++) {
-        kill(childs[i], signo);
-        waitpid(childs[i], NULL, 0);
+int test_error(int ret, bool critical = false, string where = "") {
+    if (ret == -1) {
+        if (errno == EINTR) { //Interrupted by parent process
+            return ret;
+        }
+        perror(where.c_str());
+        if (critical) {
+            exit(1);
+        }
     }
-    write(STDOUT_FILENO, "\n", 1);
+    return ret;
 }
 
 
-
-vector<char *> make_tokens(char *str, char *sep) {
-    auto *token = strtok(str, sep);
-    vector<char *> tokens;
-    while (token) {
-        tokens.push_back(token);
-        token = strtok(NULL, sep);
-    }
-    return tokens;
-}
-
-string read_string() {
-    string s = "";
-    if (!tmp.empty()) {
-        s = tmp[0];
-        tmp.erase(tmp.begin());
-    }
-    if (s.size() && s.back() == '\n') {
-        s.pop_back();
-        return s;
-    }
-    char buffer[BUFFER_SIZE];
-    ssize_t total_read_cnt = 0;
-    ssize_t read_cnt;
-
-    bool eol = 0;
-    while (!eol && (read_cnt = read(STDIN_FILENO, buffer + total_read_cnt, sizeof(buffer))) > 0) {
-        total_read_cnt += read_cnt;
-        for_each(buffer + total_read_cnt - read_cnt, buffer + total_read_cnt, [&](char &ch) {
-            if (ch == '\n') {
-                eol = 1;
-            }
-        });
-    }
-
-    if (total_read_cnt == 0 && read_cnt == 0 && !s.size()) {
-        raise(SIGINT);
-        exit(0);
-    }
-    string t = "";
-    for_each(buffer, buffer + total_read_cnt, [&](char &ch) {
-        t += ch;
-        if (ch == '\n') {
-            tmp.push_back(t);
-            t = "";
+void sigint_handler(int signum, siginfo_t *info, void *context) {
+    for_each(begin(processes), end(processes), [](int x) {
+        if (x != getpid()) {
+            TESTERR(kill(x, SIGINT));
         }
     });
-    if (t.size()) {
-        tmp.push_back(t);
-    }
-    if (!tmp.empty()) {
-        s += tmp[0];
-        tmp.erase(tmp.begin());
-    }
-    if (s.size()) {
-        s.pop_back();
-    }
-    return s;
-}
-
-void process(vector<char *> &commands) {
-    int fpipe[2];
-    int spipe[2];
-    for (auto i = 0; i < commands.size(); i++) {
-        auto parts = make_tokens(commands[i], (char *) " ");
-        pipe(spipe);
-        auto newpid = fork();
-        if (newpid < 0) {
-            perror("Error fork\n");
-        } else {
-            childs.push_back(newpid);
-        }
-        if (newpid == 0) {
-            if (i > 0) {
-                dup2(fpipe[0], STDIN_FILENO);
-                close(fpipe[0]);
-                close(fpipe[1]);
-            }
-            if (i != commands.size() - 1) dup2(spipe[1], STDOUT_FILENO);
-            close(spipe[0]);
-            close(spipe[1]);
-            parts.push_back(NULL);
-            if (execvp(parts[0], parts.data()) != 0) {
-                   exit(errno);
-            }
-        } else {
-            if (i > 0) {
-                close(fpipe[0]);
-                close(fpipe[1]);
-            }
-            if (i == commands.size() - 1) {
-                close(spipe[0]);
-                close(spipe[1]);
-            }
-        }
-        fpipe[0] = spipe[0];
-        fpipe[1] = spipe[1];
-    }
-    for (auto child : childs) {
-        waitpid(child, 0, 0);
+    if (getpid() != main_pid) {
+        exit(1);
     }
 }
 
-int main(void) {
-    struct sigaction sa;
-    sa.sa_sigaction = &sig_handler;
-    sa.sa_flags = SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGINT, &sa, NULL) != 0)
-        return errno;
-    while (1) {
-        write(STDOUT_FILENO, "$ ", 2);
-        string str = read_string();
-        vector<char *> commands = make_tokens(const_cast<char *>(str.c_str()), (char *) "|");
-        process(commands);
+vector<char *> split_command(const string &command) {
+    vector<char *> ans;
+    char *temp_str = strdup(command.c_str());
+    const char sep[3] = "\n ";
+    char *token;
+    token = strtok(temp_str, sep);
+    while (token != nullptr) {
+        ans.push_back(token);
+        token = strtok(NULL, sep);
+    }
+    return ans;
+}
+
+
+void exec_one(vector<char *> args) {
+    char *argv[args.size() + 1];
+    for (int i = 0; i < args.size(); i++) {
+        argv[i] = args[i];
+    }
+    argv[args.size()] = NULL;
+    TESTERR(execvp(argv[0], argv));
+
+}
+
+void execute_rec(string command, bool first = false) {
+    int pipe_fd[2];
+    TESTERR(pipe(pipe_fd));
+    size_t pos = command.find('|');
+    string next_command;
+    if (pos != string::npos) {
+        next_command = command.substr(pos + 1, command.size());
+        command = command.substr(0, pos);
+    }
+    vector<char *> args = split_command(command);
+
+    pid_t pid = TESTERR(fork());
+
+    if (pid == 0) {
+        if (!first) {
+            int *out_pipe = pipes.back();
+            TESTERR(dup2(out_pipe[0], STDIN_FILENO));
+            TESTERR(close(out_pipe[0]));
+        }
+        if (pos != string::npos) {
+            TESTERR(dup2(pipe_fd[1], STDOUT_FILENO));
+            TESTERR(close(pipe_fd[1]));
+        }
+        processes.push_back(getpid());
+        exec_one(args);
+    } else {
+        int res;
+        processes.push_back(getpid());
+        TESTERR(close(pipe_fd[1]));
+        if (pos != string::npos) {
+            pipes.push_back(pipe_fd);
+            execute_rec(next_command);
+        }
+        TESTERR(close(pipe_fd[0]));
+        TESTERR(waitpid(pid, &res, 0));
+    }
+}
+
+vector<char> buf(BUFFER);
+
+string read_line() {
+    string result;
+    ssize_t last_read = read(0, buf.data(), BUFFER);
+
+    if (last_read == 0) {
+        exit(0);
+    }
+    while (last_read != 0) {
+        if (last_read == -1) {
+            if (errno != EINTR) {
+                perror("read");
+            }
+            exit(0);
+        }
+        for (int i = 0; i < last_read; i++) {
+            result += buf[i];
+        }
+        if (buf[last_read - 1] == '\n') {
+            break;
+        }
+        last_read = read(0, buf.data(), BUFFER);
+    }
+    return result;
+}
+
+
+int main() {
+    struct sigaction action;
+    action.sa_sigaction = &sigint_handler;
+    action.sa_flags = SA_SIGINFO;
+    TESTERR(sigemptyset(&action.sa_mask));
+    TESTERR(sigaddset(&action.sa_mask, SIGINT));
+    TESTERR(sigaction(SIGINT, &action, NULL));
+    main_pid = getpid();
+    write(STDOUT_FILENO, "\n$", 2);
+    while (true) {
+        string command = read_line();
+        if (command.size() == 0) {
+            break;
+        }
+        execute_rec(command, true);
+        pipes.clear();
+        processes.clear();
+        write(STDOUT_FILENO, "\n$", 2);
     }
 }
